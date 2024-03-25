@@ -2,7 +2,6 @@ use bytes::{Bytes, BytesMut};
 use internet_checksum::Checksum;
 use pnet::packet::Packet;
 use pnet::packet::{ip, ipv4, ipv6, tcp};
-use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr};
 
 const IPV4_HEADER_LEN: usize = 20;

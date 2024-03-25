@@ -43,7 +43,7 @@
 pub mod packet;
 
 use bytes::{Bytes, BytesMut};
-use log::{error, info, trace, warn};
+use log::{error, info, warn, trace};
 use packet::*;
 use pnet::packet::{tcp, Packet};
 use rand::prelude::*;
@@ -52,12 +52,14 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
-use tokio::time;
-use tokio_tun::Tun;
+use async_broadcast as broadcast;
+use async_channel::{Sender, Receiver};
+use std::time::Duration;
+use futures::{FutureExt, select};
+use compio::runtime::{time, TryClone};
+use compio_tun::Tun;
 
-const TIMEOUT: time::Duration = time::Duration::from_secs(1);
+const TIMEOUT: Duration = Duration::from_secs(1);
 const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
 const MPSC_BUFFER_LEN: usize = 128;
@@ -81,8 +83,8 @@ impl AddrTuple {
 struct Shared {
     tuples: RwLock<HashMap<AddrTuple, flume::Sender<Bytes>>>,
     listening: RwLock<HashSet<u16>>,
-    tun: Vec<Arc<Tun>>,
-    ready: mpsc::Sender<Socket>,
+    tun: Vec<Tun>,
+    ready: Sender<Socket>,
     tuples_purge: broadcast::Sender<AddrTuple>,
 }
 
@@ -90,7 +92,7 @@ pub struct Stack {
     shared: Arc<Shared>,
     local_ip: Ipv4Addr,
     local_ip6: Option<Ipv6Addr>,
-    ready: mpsc::Receiver<Socket>,
+    ready: Receiver<Socket>,
 }
 
 pub enum State {
@@ -102,7 +104,7 @@ pub enum State {
 
 pub struct Socket {
     shared: Arc<Shared>,
-    tun: Arc<Tun>,
+    tun: Tun,
     incoming: flume::Receiver<Bytes>,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
@@ -122,7 +124,7 @@ pub struct Socket {
 impl Socket {
     fn new(
         shared: Arc<Shared>,
-        tun: Arc<Tun>,
+        tun: Tun,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
         ack: Option<u32>,
@@ -167,7 +169,7 @@ impl Socket {
     ///
     /// A return of `None` means the Tun socket returned an error
     /// and this socket must be closed.
-    pub async fn send(&self, payload: &[u8]) -> Option<()> {
+    pub async fn send(&mut self, payload: &[u8]) -> Option<()> {
         match self.state {
             State::Established => {
                 let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, Some(payload));
@@ -324,7 +326,7 @@ impl Drop for Socket {
         // dissociates ourself from the dispatch map
         assert!(self.shared.tuples.write().unwrap().remove(&tuple).is_some());
         // purge cache
-        self.shared.tuples_purge.send(tuple).unwrap();
+        self.shared.tuples_purge.try_broadcast(tuple).unwrap();
 
         let buf = build_tcp_packet(
             self.local_addr,
@@ -359,24 +361,24 @@ impl Stack {
     /// When more than one [`Tun`](tokio_tun::Tun) object is passed in, same amount
     /// of reader will be spawned later. This allows user to utilize the performance
     /// benefit of Multiqueue Tun support on machines with SMP.
-    pub fn new(tun: Vec<Tun>, local_ip: Ipv4Addr, local_ip6: Option<Ipv6Addr>) -> Stack {
-        let tun: Vec<Arc<Tun>> = tun.into_iter().map(Arc::new).collect();
-        let (ready_tx, ready_rx) = mpsc::channel(MPSC_BUFFER_LEN);
-        let (tuples_purge_tx, _tuples_purge_rx) = broadcast::channel(16);
+    pub fn new(tuns: Vec<Tun>, local_ip: Ipv4Addr, local_ip6: Option<Ipv6Addr>) -> Stack {
+        let (ready_tx, ready_rx) = async_channel::bounded(MPSC_BUFFER_LEN);
+        let (tuples_purge_tx, _tuples_purge_rx) = broadcast::broadcast(16);
+        let cloned_tuns :Vec<Tun> = tuns.iter().map(|x| x.try_clone().unwrap()).collect();
         let shared = Arc::new(Shared {
             tuples: RwLock::new(HashMap::new()),
-            tun: tun.clone(),
+            tun: tuns,
             listening: RwLock::new(HashSet::new()),
             ready: ready_tx,
             tuples_purge: tuples_purge_tx.clone(),
         });
 
-        for t in tun {
-            tokio::spawn(Stack::reader_task(
+        for t in cloned_tuns {
+            compio::runtime::spawn(Stack::reader_task(
                 t,
                 shared.clone(),
-                tuples_purge_tx.subscribe(),
-            ));
+                tuples_purge_tx.new_receiver()
+            )).detach();
         }
 
         Stack {
@@ -411,9 +413,11 @@ impl Stack {
             local_port,
         );
         let tuple = AddrTuple::new(local_addr, addr);
+        let rand_tun = self.shared.tun.choose(&mut rng).unwrap();
+        let cloned_rand_tun = rand_tun.try_clone().unwrap();
         let (mut sock, incoming) = Socket::new(
             self.shared.clone(),
-            self.shared.tun.choose(&mut rng).unwrap().clone(),
+            cloned_rand_tun,
             local_addr,
             addr,
             None,
@@ -429,7 +433,7 @@ impl Stack {
     }
 
     async fn reader_task(
-        tun: Arc<Tun>,
+        mut tun: Tun,
         shared: Arc<Shared>,
         mut tuples_purge: broadcast::Receiver<AddrTuple>,
     ) {
@@ -438,8 +442,8 @@ impl Stack {
         loop {
             let mut buf = BytesMut::zeroed(MAX_PACKET_LEN);
 
-            tokio::select! {
-                size = tun.recv(&mut buf) => {
+            select! {
+                size = tun.recv(&mut buf).fuse() => {
                     let size = size.unwrap();
                     buf.truncate(size);
                     let buf = buf.freeze();
@@ -484,9 +488,10 @@ impl Stack {
                             {
                                 // SYN seen on listening socket
                                 if tcp_packet.get_sequence() == 0 {
+                                    let cloned_tun = tun.try_clone().unwrap();
                                     let (sock, incoming) = Socket::new(
                                         shared.clone(),
-                                        tun.clone(),
+                                        cloned_tun,
                                         local_addr,
                                         remote_addr,
                                         Some(tcp_packet.get_sequence() + 1),
@@ -498,7 +503,7 @@ impl Stack {
                                         .unwrap()
                                         .insert(tuple, incoming)
                                         .is_none());
-                                    tokio::spawn(sock.accept());
+                                    compio::runtime::spawn(sock.accept()).detach();
                                 } else {
                                     trace!("Bad TCP SYN packet from {}, sending RST", remote_addr);
                                     let buf = build_tcp_packet(
@@ -529,7 +534,7 @@ impl Stack {
                         }
                     }
                 },
-                tuple = tuples_purge.recv() => {
+                tuple = tuples_purge.recv().fuse() => {
                     let tuple = tuple.unwrap();
                     tuples.remove(&tuple);
                     trace!("Removed cached tuple: {:?}", tuple);
